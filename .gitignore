@@ -28,6 +28,7 @@ ENV/
 
 # Environment variables
 .env
+.env.bak
 
 # IDE
 .vscode/
@@ -42,3 +43,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated story output
+story_output/
+session_cache/

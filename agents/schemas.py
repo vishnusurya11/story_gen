@@ -52,7 +52,7 @@ class Character(BaseModel):
     backstory: str = Field(description="Brief backstory (2-3 sentences)")
     internal_flaw: str = Field(description="Their internal flaw or wound")
     arc_summary: str = Field(description="How they will change (or fail to change) through the story")
-    key_conflicts: str = Field(description="Internal and external conflicts they face")
+    key_conflicts: str = Field(description="Description of the internal and external conflicts they face (as a single text paragraph)")
 
 
 # Agent 5.5: Scene Breakdown Agent

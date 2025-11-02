@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 sys.path.append(str(Path(__file__).parent.parent))
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END, START
 
 # Import tools
@@ -79,7 +80,11 @@ def get_llm(schema=None):
     elif provider == "ollama":
         from langchain_ollama import ChatOllama
         base_url = os.getenv("OLLAMA_BASE_URL", "https://ollama.com")
+
+        # Use minimax-m2:cloud - only free unlimited Ollama cloud model
+        # Fallback to OpenAI is handled in invoke_with_schema_validation()
         model = os.getenv("OLLAMA_MODEL", "minimax-m2:cloud")
+
         api_key = os.getenv("OLLAMA_API_KEY")
 
         if "ollama.com" in base_url and not api_key:
@@ -91,24 +96,188 @@ def get_llm(schema=None):
                 "3. Add to .env file: OLLAMA_API_KEY=your_key_here"
             )
 
+        # CRITICAL: Use temperature=0 for structured output (deterministic)
+        # Use temperature=0.7 for creative prose generation
+        temperature = 0 if schema else 0.7
+
         kwargs = {
             "base_url": base_url,
             "model": model,
-            "temperature": 0.7
+            "temperature": temperature  # Dynamic temperature based on use case
         }
 
         if api_key:
             kwargs["api_key"] = api_key
 
-        llm = ChatOllama(**kwargs)
-
-        # Ollama with tool-calling models supports structured output
+        # CRITICAL: Use native Ollama format parameter with JSON schema
+        # This is MORE RELIABLE than .with_structured_output() abstraction
+        # Native Ollama format parameter is officially documented and supported
         if schema:
-            return llm.with_structured_output(schema)
+            kwargs["format"] = schema.model_json_schema()
+
+        llm = ChatOllama(**kwargs)
         return llm
 
     else:
         raise ValueError(f"Unknown LLM provider: {provider}. Choose 'gemini' or 'ollama'")
+
+
+def invoke_with_schema_validation(llm, messages, schema, max_retries=2):
+    """
+    Invoke LLM with schema validation. Automatically fallback to OpenAI if primary fails.
+
+    Strategy:
+    1. Try primary LLM (Ollama minimax-m2) with retries
+    2. On any error, fallback to OpenAI gpt-4o-mini
+    3. Both providers use native JSON schema support
+
+    Args:
+        llm: Primary LLM instance (usually Ollama)
+        messages: List of messages to send
+        schema: Pydantic BaseModel class for validation
+        max_retries: Maximum retry attempts per provider (default: 2)
+
+    Returns:
+        Validated Pydantic model instance
+
+    Raises:
+        Exception: If both primary and OpenAI fallback fail
+    """
+    import json
+    from pydantic import ValidationError
+
+    # Helper function to parse and validate response
+    def parse_and_validate(response_text):
+        """Parse JSON and validate against schema."""
+        # Remove markdown code blocks if present
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+
+        response_text = response_text.strip()
+
+        # Parse and validate
+        parsed_json = json.loads(response_text)
+        validated_obj = schema(**parsed_json)
+        return validated_obj
+
+    # ============================================================
+    # PHASE 1: Try Primary LLM (Ollama)
+    # ============================================================
+    primary_errors = []
+
+    for attempt in range(max_retries):
+        try:
+            response = llm.invoke(messages)
+            response_text = response.content.strip()
+
+            # Parse and validate
+            validated_obj = parse_and_validate(response_text)
+            return validated_obj  # Success!
+
+        except Exception as e:
+            error_msg = str(e)
+            primary_errors.append(error_msg)
+
+            is_last_retry = (attempt == max_retries - 1)
+
+            if is_last_retry:
+                print(f"  ⚠️  Primary LLM failed after {max_retries} attempts")
+                print(f"  Last error: {error_msg[:150]}...")
+                break  # Move to OpenAI fallback
+            else:
+                print(f"  ⚠️  Retry {attempt + 1}/{max_retries} (error: {type(e).__name__})...")
+
+                # Add schema reminder to prompt (prompt engineering)
+                if isinstance(e, (json.JSONDecodeError, ValidationError)):
+                    schema_str = json.dumps(schema.model_json_schema(), indent=2)
+                    messages[0].content += f"\n\nREMINDER: Return ONLY valid JSON matching this schema:\n{schema_str}"
+
+    # ============================================================
+    # PHASE 2: Try OpenAI Fallback
+    # ============================================================
+    openai_key = os.getenv("OPENAI_API_KEY")
+    openai_model = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
+
+    if not openai_key:
+        print(f"  ❌ No OpenAI fallback configured (OPENAI_API_KEY not set)")
+        print(f"  Primary LLM errors: {primary_errors}")
+        raise Exception(f"Primary LLM failed and no OpenAI fallback: {primary_errors[-1]}")
+
+    print(f"  🔄 Switching to OpenAI fallback ({openai_model})...")
+
+    # Create OpenAI LLM with JSON object mode
+    # Using json_object instead of json_schema to avoid additionalProperties requirement
+    # Pydantic validation happens after, so we still get strict type checking
+    openai_llm = ChatOpenAI(
+        model=openai_model,
+        api_key=openai_key,
+        temperature=0,  # Deterministic for structured output
+        model_kwargs={
+            "response_format": {"type": "json_object"}
+        }
+    )
+
+    # Prepare messages for OpenAI with JSON instruction
+    # OpenAI json_object mode REQUIRES the word "json" to appear in the prompt
+    openai_messages = messages.copy()
+    if openai_messages:
+        # Show expected field structure to guide OpenAI without sending full schema
+        # This prevents OpenAI from echoing the schema back or using wrong types
+        field_examples = {}
+        for field_name, field_info in schema.model_fields.items():
+            # Get base type name (handle Optional, List, etc.)
+            if hasattr(field_info.annotation, '__name__'):
+                field_type = field_info.annotation.__name__
+            else:
+                # Handle complex types like List[str], Optional[int], etc.
+                field_type = str(field_info.annotation).replace('typing.', '')
+            field_examples[field_name] = f"<{field_type}>"
+
+        example_structure = json.dumps(field_examples, indent=2)
+        openai_messages[0].content += f"\n\n**IMPORTANT**: Respond with JSON matching this exact structure (replace <type> placeholders with actual values):\n{example_structure}"
+
+    openai_errors = []
+
+    for attempt in range(max_retries):
+        try:
+            response = openai_llm.invoke(openai_messages)
+            response_text = response.content.strip()
+
+            # Parse and validate
+            validated_obj = parse_and_validate(response_text)
+
+            print(f"  ✅ Success with OpenAI {openai_model}")
+            return validated_obj  # Success!
+
+        except Exception as e:
+            error_msg = str(e)
+            openai_errors.append(error_msg)
+
+            is_last_retry = (attempt == max_retries - 1)
+
+            if is_last_retry:
+                print(f"  ❌ OpenAI fallback also failed after {max_retries} attempts")
+                print(f"  Primary errors: {primary_errors}")
+                print(f"  OpenAI errors: {openai_errors}")
+                raise Exception(
+                    f"Both primary and OpenAI fallback failed.\n"
+                    f"Primary: {primary_errors[-1]}\n"
+                    f"OpenAI: {openai_errors[-1]}"
+                )
+            else:
+                print(f"  ⚠️  OpenAI retry {attempt + 1}/{max_retries}...")
+
+                # Add schema reminder for validation errors
+                if isinstance(e, (json.JSONDecodeError, ValidationError)):
+                    schema_str = json.dumps(schema.model_json_schema(), indent=2)
+                    messages[0].content += f"\n\nREMINDER: Return ONLY valid JSON matching this schema:\n{schema_str}"
+
+    # Should never reach here
+    raise Exception("Unexpected: All retry logic exhausted")
 
 
 # Define the state for our multi-agent system
@@ -275,19 +444,19 @@ def story_source_agent(state: StoryGenerationState) -> StoryGenerationState:
 
     prompt = f"""Provide detailed information about the story "{user_story}".
 
-Include:
-- Full official title
-- Type (novel/film/myth/short story/play/etc.)
-- Original author or creator
-- Main theme or central message
-- Story structure overview
-- Plot summary (2-3 paragraphs)
-- Key story beats (5-7 major plot points)
+You MUST return structured data with these exact fields:
+- title: Full official title
+- type: Type (novel/film/myth/short story/play/etc.)
+- author_or_creator: Original author or creator name
+- main_theme: Main theme or central message
+- story_structure: Overview of the story's structure
+- plot_summary: Detailed plot summary (2-3 paragraphs)
+- key_beats: List of 5-7 major plot points as strings
 
-Be comprehensive and accurate."""
+Be comprehensive and accurate. Focus on factual information about the story."""
 
     from langchain_core.messages import HumanMessage
-    story_info = structured_llm.invoke([HumanMessage(content=prompt)])
+    story_info = invoke_with_schema_validation(structured_llm, [HumanMessage(content=prompt)], StoryInfo)
 
     state["source_story"] = {
         "title": story_info.title,
@@ -332,17 +501,21 @@ def setting_agent(state: StoryGenerationState) -> StoryGenerationState:
 
     prompt = f"""Create detailed world-building for a {user_setting} setting.
 
-Include:
-1. The genre ({user_setting})
-2. Rich description (2-3 paragraphs) covering visual atmosphere, technology/magic level, and daily life
-3. Key locations (3-5 important places in this world)
-4. Overall atmosphere and mood
-5. Unique elements that make this setting distinctive
+IMPORTANT: Provide structured data with these exact fields:
+- genre: The setting genre ("{user_setting}")
+- description: Rich 2-3 paragraph description covering visual atmosphere, technology/magic level, and daily life
+- key_locations: List of 3-5 important places in this world (as strings)
+- atmosphere: Overall mood and atmosphere description
+- unique_elements: List of 2-4 unique aspects that make this setting distinctive (as strings)
 
-Be creative, vivid, and immersive. This is for a novel."""
+Requirements:
+1. Be creative, vivid, and immersive
+2. Match the {user_setting} genre throughout
+3. Make it suitable for a novel setting
+4. Include specific, concrete details"""
 
     from langchain_core.messages import HumanMessage
-    setting_info = structured_llm.invoke([HumanMessage(content=prompt)])
+    setting_info = invoke_with_schema_validation(structured_llm, [HumanMessage(content=prompt)], SettingInfo)
 
     state["setting"] = {
         "genre": setting_info.genre,
@@ -395,9 +568,12 @@ def beat_sheet_agent(state: StoryGenerationState) -> StoryGenerationState:
 
         prompt = f"""Generate Beat #{beat_template['number']}: **{beat_template['name']}** for a novel.
 
-Beat Number: {beat_template['number']}
-Beat Name: {beat_template['name']}
-Beat Percentage: {beat_template['percentage']}
+IMPORTANT: Provide structured data with these exact fields:
+- number: {beat_template['number']}
+- name: {beat_template['name']}
+- percentage: {beat_template['percentage']}
+- description: Detailed 2-4 paragraph description of what happens in this beat
+
 Beat Purpose: {beat_template['description']}
 
 Story Context:
@@ -407,16 +583,15 @@ Story Context:
 - Setting: {setting['genre']}
 - Previous Beats: {previous_beats_summary}
 
-Create a detailed, specific description of what happens in this beat for THIS story.
+Requirements:
 - Be concrete and actionable
 - Include character emotions and motivations
 - Connect to the hero arc
 - Fit the {setting['genre']} setting
 - Adapt elements from {source_story['title']}
+- Provide 2-4 paragraphs. Be creative and engaging."""
 
-Provide 2-4 paragraphs describing this beat. Be creative and engaging."""
-
-        beat_info = structured_llm.invoke([HumanMessage(content=prompt)])
+        beat_info = invoke_with_schema_validation(structured_llm, [HumanMessage(content=prompt)], BeatDescription)
 
         beat_data = {
             "number": beat_info.number,
@@ -455,51 +630,80 @@ def character_agent(state: StoryGenerationState) -> StoryGenerationState:
     print("\n  Creating protagonist...", end="", flush=True)
     protagonist_prompt = f"""Create a detailed protagonist for this story:
 
-Role: Hero
-Hero Arc: {hero_arc['name']} - {hero_arc['want_need_relationship']}
-Setting: {setting['genre']}
-Source Inspiration: {source_story['title']}
+IMPORTANT: Provide structured data with these exact fields:
+- name: Character's name
+- role: "Hero"
+- age: Approximate age or age range
+- primary_want: What they consciously desire (external goal)
+- primary_need: What they actually need to become whole (internal growth)
+- personality_traits: 2-3 sentences describing personality
+- backstory: Brief backstory (2-3 sentences)
+- internal_flaw: Their internal flaw or wound
+- arc_summary: How they will change (or fail to change) through the story
+- key_conflicts: Internal and external conflicts they face
 
-The protagonist must have:
-1. A clear WANT (external goal)
-2. A clear NEED (internal growth required)
-3. A compelling backstory
-4. Personality traits
-5. Internal flaw/wound
+Context:
+- Role: Hero
+- Hero Arc: {hero_arc['name']} - {hero_arc['want_need_relationship']}
+- Setting: {setting['genre']}
+- Source Inspiration: {source_story['title']}
 
-Based on the {hero_arc['name']}, remember:
-{hero_arc['description']}
+Based on the {hero_arc['name']}, remember: {hero_arc['description']}"""
 
-Create a complete character profile with all required fields."""
-
-    protagonist = structured_llm.invoke([HumanMessage(content=protagonist_prompt)])
+    protagonist = invoke_with_schema_validation(structured_llm, [HumanMessage(content=protagonist_prompt)], Character)
     print(" ✓")
 
     # Generate antagonist
     print("  Creating antagonist...", end="", flush=True)
     antagonist_prompt = f"""Create a compelling antagonist for this story:
 
-Role: Antagonist
-Setting: {setting['genre']}
-Source Inspiration: {source_story['title']}
-Hero's Goal: {protagonist.primary_want}
+IMPORTANT: Provide structured data with these exact fields:
+- name: Character's name
+- role: "Antagonist"
+- age: Approximate age or age range
+- primary_want: What they consciously desire
+- primary_need: What they actually need
+- personality_traits: 2-3 sentences describing personality
+- backstory: Brief backstory (2-3 sentences)
+- internal_flaw: Their internal flaw or wound
+- arc_summary: Their character arc
+- key_conflicts: Conflicts they represent
 
-The antagonist opposes the hero and represents a thematic contrast.
-Create a complete character profile with all required fields."""
+Context:
+- Role: Antagonist
+- Setting: {setting['genre']}
+- Source Inspiration: {source_story['title']}
+- Hero's Goal: {protagonist.primary_want}
 
-    antagonist = structured_llm.invoke([HumanMessage(content=antagonist_prompt)])
+The antagonist opposes the hero and represents a thematic contrast."""
+
+    antagonist = invoke_with_schema_validation(structured_llm, [HumanMessage(content=antagonist_prompt)], Character)
     print(" ✓")
 
     # Generate supporting character (mentor/ally)
     print("  Creating supporting characters...", end="", flush=True)
     support_prompt = f"""Create a supporting character (mentor or ally) for this story:
 
-Role: Mentor/Ally
-Setting: {setting['genre']}
-This character should guide or support the protagonist.
-Create a complete character profile with all required fields."""
+IMPORTANT: Provide structured data with these exact fields:
+- name: Character's name
+- role: "Mentor" or "Ally"
+- age: Approximate age or age range
+- primary_want: What they consciously desire
+- primary_need: What they actually need
+- personality_traits: 2-3 sentences describing personality
+- backstory: Brief backstory (2-3 sentences)
+- internal_flaw: Their internal flaw or wound
+- arc_summary: Their character arc
+- key_conflicts: Conflicts they face
 
-    support_char = structured_llm.invoke([HumanMessage(content=support_prompt)])
+Context:
+- Role: Mentor/Ally
+- Setting: {setting['genre']}
+- Source Inspiration: {source_story['title']}
+
+This character should guide or support the protagonist."""
+
+    support_char = invoke_with_schema_validation(structured_llm, [HumanMessage(content=support_prompt)], Character)
     print(" ✓")
 
     # Store characters as structured objects
@@ -539,26 +743,23 @@ def scene_breakdown_agent(state: StoryGenerationState) -> StoryGenerationState:
 
         scene_prompt = f"""Break down this story beat into {scene_count} detailed scenes.
 
+IMPORTANT: Return a list of scenes with these EXACT fields for each scene:
+- scene_number: Sequential number (1, 2, 3...)
+- setting: Specific location (e.g., "Cargo bay of starship at dawn")
+- characters: List of character names present (as strings)
+- time_mood: Time of day and emotional atmosphere
+- purpose: What this scene accomplishes narratively
+- key_events: List of 3-5 specific things that happen (as strings)
+- emotional_beat: How characters feel or change emotionally
+- word_target: Target word count (must be between 200-300)
+
 Beat #{beat['number']}: {beat['name']}
-Beat Description:
-{beat['description']}
+Beat Description: {beat['description']}
 
 Story Context:
 - Setting: {state['setting']['genre']}
 - Hero Arc: {state['hero_arc']['name']}
 - Characters Available: {[c.get('type', 'character') for c in state['characters']]}
-
-TASK: Create {scene_count} scenes for this beat.
-
-For each scene, provide:
-- scene_number (sequential: 1, 2, 3...)
-- setting (specific location like "Cargo bay of starship at dawn")
-- characters (list of character names present)
-- time_mood (time of day and emotional atmosphere)
-- purpose (what this scene accomplishes narratively)
-- key_events (list of 3-5 specific things that happen)
-- emotional_beat (how characters feel or change emotionally)
-- word_target (200-300 words)
 
 Requirements:
 - Create {scene_count} scenes total
@@ -568,7 +769,7 @@ Requirements:
 - Include specific, concrete details"""
 
         try:
-            scene_list = structured_llm.invoke([HumanMessage(content=scene_prompt)])
+            scene_list = invoke_with_schema_validation(structured_llm, [HumanMessage(content=scene_prompt)], SceneList)
 
             # Convert Pydantic models to dicts
             scenes = [scene.model_dump() for scene in scene_list.scenes]
